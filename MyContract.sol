@@ -2,6 +2,7 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
@@ -9,23 +10,23 @@ contract DePinVPN is ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
     IERC20 public usdcToken;
-    uint256 public platformBalance; //accumulated platform fees (USDC smallest unit)
-    uint256 public platformFeeBp = 500; // basis points (500 = 5%)
+    uint256 public platformBalance; // accumulated platform fees (USDC smallest unit)
+    uint256 public platformFeeBp = 500; // platform fee in basis points (default 500 = 5%)
     uint256 public constant MAX_PLATFORM_FEE_BP = 1000; // max 10%
     uint256 public constant USDC_DECIMALS = 6; // USDC has 6 decimals
 
     struct VPNNode {
-        address owner;
-        string ipAddress; // Consider IPFS/hash for privacy
-        uint256 bandwidthAvailable; // in GB (or other units)
-        uint256 pricePerGB; // price expressed in USDC smallest unit (6 decimals)
+        address owner; // provider address
+        string ipAddress; // string (privacy note: plain IP stored on-chain. Consider encryption for privacy)
+        uint256 bandwidthAvailable; // available bandwith (units in GB  or other units)
+        uint256 pricePerGB; // price expressed in USDC, smallest unit (6 decimals)
         uint256 totalEarned;
         uint256 reputation;
         bool isActive;
     }
     
     struct VPNConnection {
-        address client;
+        address client; // client address
         uint256 nodeId;
         uint256 startTime;
         uint256 endTime;
@@ -45,7 +46,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
 
     // Events
     event NodeRegistered(uint256 indexed nodeId, address indexed owner, uint256 pricePerGB);
-    event NodeUpdated(uint256 indexed nodeId, address indexed owner);\
+    event NodeUpdated(uint256 indexed nodeId, address indexed owner);
     event NodeDeactivated(uint256 indexed nodeId, address indexed owner);
     event ConnectionStarted(uint256 indexed connectionId, address indexed client, uint256 indexed nodeId, uint256 expectedBandwidth, uint256 amountPaid);
     event ConnectionStopped(uint256 indexed connectionId, uint256 actualBandwidthUsed, uint256 providerShare, uint256 platformShare);
@@ -61,6 +62,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
 
     // ----- Node management -----
 
+    // Providers register their VPN nodes
     function registerNode(string calldata _ip, uint256 _bandwidth, uint256 _pricePerGB) external {
         require(_pricePerGB > 0, "Price must be positive");
         require(_bandwidth > 0, "Bandwidth must be positive");
@@ -79,6 +81,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
         emit NodeRegistered(nodeCounter, msg.sender, _pricePerGB);
     }
 
+    // Providers can update their node details
     function updateNodePrice(uint256 _nodeId, uint256 _newPricePerGB) external {
         VPNNode storage node = nodes[_nodeId];
         require(node.owner != address(0), "Node not found");
@@ -88,6 +91,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
         emit NodeUpdated(_nodeId, msg.sender);
     }
 
+    // Providers can activate/deactivate their nodes
     function setNodeActive(uint256 _nodeId, bool _active) external {
         VPNNode storage node = nodes[_nodeId];
         require(node.owner != address(0), "Node not found");
@@ -127,7 +131,6 @@ contract DePinVPN is ReentrancyGuard, Ownable {
             endTime: 0,
             expectedBandwidth: _expectedBandwidth,
             actualBandwidthUsed: 0,
-            bandwidthUsed: 0,
             isActive: true,
             finalized: false,
             amountPaid: expectedCost
@@ -253,11 +256,10 @@ contract DePinVPN is ReentrancyGuard, Ownable {
     
     function setPlatformFee(uint256 _feeBp) external onlyOwner {
         require(_feeBp <= MAX_PLATFORM_FEE_BP, "Fee too high");
-        platformFee = _feeBp;
+        platformFeeBp = _feeBp;
         emit PlatformFeeUpdated(_feeBp);
     }
 
-}
     // ----- Views / Helpers -----
 
     function getNode(uint256 _nodeId) external view returns (VPNNode memory) {
@@ -267,4 +269,6 @@ contract DePinVPN is ReentrancyGuard, Ownable {
     function getConnection(uint256 _connectionId) external view returns (VPNConnection memory) {
         return connections[_connectionId];
     }
+
+}
 
