@@ -71,7 +71,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
         nodes[nodeCounter] = VPNNode({
             owner: msg.sender,
             ipAddress: _ip,
-            bandwidthAvailable: _bandwidth,
+            bandwidthAvailable: _bandwidth, // remove bandwidth, consider in future
             pricePerGB: _pricePerGB,
             totalEarned: 0,
             reputation: 100,
@@ -111,7 +111,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
         VPNNode storage node = nodes[_nodeId];
         require(node.owner != address(0), "Node not found");
         require(node.isActive, "Node not active");
-        require(_expectedBandwidth > 0, "Expected bandwidth must be positive");
+        require(_expectedBandwidth > 0, "Expected bandwidth must be positive"); // remove bandwidth, consider in future
         require(node.bandwidthAvailable >= _expectedBandwidth, "Insufficient bandwidth");
         
         uint256 expectedCost = _expectedBandwidth * node.pricePerGB;
