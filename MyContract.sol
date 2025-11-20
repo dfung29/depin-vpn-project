@@ -9,119 +9,161 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 contract DePinVPN is ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
+
     IERC20 public usdcToken;
-    uint256 public platformBalance; // accumulated platform fees (USDC smallest unit)
-    uint256 public platformFeeBp = 500; // platform fee in basis points (default 500 = 5%)
-    uint256 public constant MAX_PLATFORM_FEE_BP = 1000; // max 10%
-    uint256 public constant USDC_DECIMALS = 6; // USDC has 6 decimals
+
 
     struct VPNNode {
-        address owner; // provider address
-        string ipAddress; // string (privacy note: plain IP stored on-chain. Consider encryption for privacy)
-        uint256 bandwidthAvailable; // available bandwith (units in GB  or other units)
-        uint256 pricePerGB; // price expressed in USDC, smallest unit (6 decimals)
+        address owner; 
+        string ipAddress;       // IP stored on-chain. For future reference, consider encryption for privacy)
+        uint16 port;           
+        uint256 pricePerMinute; // price expressed in USDC (smallest unit) per minute
         uint256 totalEarned;
         uint256 reputation;
         bool isActive;
+        uint256 maxConcurrentUsers;
+        uint256 currentUsers;
     }
     
     struct VPNConnection {
-        address client; // client address
+        address client;
         uint256 nodeId;
         uint256 startTime;
         uint256 endTime;
-        uint256 expectedBandwidth;
-        uint256 actualBandwidthUsed;
+        uint256 totalMinutesUsed; // Simple minute tracking
         bool isActive;
-        bool finalized;
         uint256 amountPaid;
     }
     
+
+    // State variables
     mapping(uint256 => VPNNode) public nodes;
     mapping(uint256 => VPNConnection) public connections;
     mapping(address => uint256) public providerBalances;
+    mapping(address => uint256) public clientBalances;
+    
     
     uint256 public nodeCounter;
     uint256 public connectionCounter;
+    uint256 public platformFeeBp = 500; // 5% platform fee
+    uint256 public constant MAX_PLATFORM_FEE_BP = 1000; // Max 10%
+
+    uint256 public platformBalance;
 
     // Events
-    event NodeRegistered(uint256 indexed nodeId, address indexed owner, uint256 pricePerGB);
-    event NodeUpdated(uint256 indexed nodeId, address indexed owner);
-    event NodeDeactivated(uint256 indexed nodeId, address indexed owner);
-    event ConnectionStarted(uint256 indexed connectionId, address indexed client, uint256 indexed nodeId, uint256 expectedBandwidth, uint256 amountPaid);
-    event ConnectionStopped(uint256 indexed connectionId, uint256 actualBandwidthUsed, uint256 providerShare, uint256 platformShare);
-    event ConnectionResolved(uint256 indexed connectionId, uint256 actualBandwidthUsed, address indexed resolver);
-    event Withdrawn(address indexed provider, uint256 amount);
-    event PlatformWithdrawn(address indexed to, uint256 amount);
+    event NodeRegistered(uint256 indexed nodeId, address indexed owner, string ipAddress, uint16 port, uint256 pricePerMinute);
+    
+    event NodePriceUpdated(uint256 indexed nodeId, uint256 newPricePerMinute);
+    event NodeIPUpdated(uint256 indexed nodeId, string newIp);
+    event NodePortUpdated(uint256 indexed nodeId, uint16 newPort);
+
+    event NodeDeactivated(uint256 indexed nodeId);
+    event NodeReactivated(uint256 indexed nodeId);
+    
+    event ConnectionStarted(uint256 indexed connectionId, address indexed client, uint256 indexed nodeId, uint256 amountPaid);
+    event ConnectionStopped(uint256 indexed connectionId, uint256 minutesUsed, uint256 totalCost, uint256 refundAmount);
+    
+    event Withdrawn(address indexed to, uint256 amount);
     event PlatformFeeUpdated(uint256 newFeeBp);
+    event PlatformFeesWithdrawn(address indexed to, uint256 amount);
+
 
     constructor(address _usdc) {
         require(_usdc != address(0), "Invalid USDC address");
         usdcToken = IERC20(_usdc);
     }
+    
 
-    // ----- Node management -----
+    // ========== NODE MANAGEMENT ==========
 
-    // Providers register their VPN nodes
-    function registerNode(string calldata _ip, uint256 _bandwidth, uint256 _pricePerGB) external {
-        require(_pricePerGB > 0, "Price must be positive");
-        require(_bandwidth > 0, "Bandwidth must be positive");
+    function registerNode(
+        string calldata _ipAddress,
+        uint16 _port,
+        uint256 _maxConcurrentUsers,
+        uint256 _pricePerMinute
+    ) external {
+        require(_maxConcurrentUsers > 0, "Max users must be positive");
+        require(_port > 0 && _port <= 65535, "Invalid port");
+        require(bytes(_ipAddress).length > 0, "IP address required");
+        require(_pricePerMinute > 0, "Price per minute must be positive");
 
         nodeCounter++;
         nodes[nodeCounter] = VPNNode({
             owner: msg.sender,
-            ipAddress: _ip,
-            bandwidthAvailable: _bandwidth, // remove bandwidth, consider in future
-            pricePerGB: _pricePerGB,
+            ipAddress: _ipAddress,
+            port: _port,
+            pricePerMinute: _pricePerMinute,
             totalEarned: 0,
             reputation: 100,
             isActive: true
+            maxConcurrentUsers: _maxConcurrentUsers,
+            currentUsers: 0
         });
-        
-        emit NodeRegistered(nodeCounter, msg.sender, _pricePerGB);
+
+        emit NodeRegistered(nodeCounter, msg.sender, _ipAddress, _port, _pricePerMinute);
     }
 
-    // Providers can update their node details
-    function updateNodePrice(uint256 _nodeId, uint256 _newPricePerGB) external {
+    function updateNodeIP(uint256 _nodeId, string calldata _newIP) external {
         VPNNode storage node = nodes[_nodeId];
-        require(node.owner != address(0), "Node not found");
-        require(msg.sender == node.owner, "Not node owner");
-        require(_newPricePerGB > 0, "Price must be > 0");
-        node.pricePerGB = _newPricePerGB;
-        emit NodeUpdated(_nodeId, msg.sender);
+        require(node.owner == msg.sender, "Not node owner");
+        require(bytes(_newIP).length > 0, "IP address required");
+        node.ipAddress = _newIP;
+        emit NodeIPUpdated(_nodeId, _newIP);
     }
 
-    // Providers can activate/deactivate their nodes
-    function setNodeActive(uint256 _nodeId, bool _active) external {
+    function updateNodePort(uint256 _nodeId, uint16 _newPort) external {
         VPNNode storage node = nodes[_nodeId];
-        require(node.owner != address(0), "Node not found");
-        require(msg.sender == node.owner, "Not node owner");
-        node.isActive = _active;
-        if (_active) {
-            emit NodeUpdated(_nodeId, msg.sender);
-        } else {
-            emit NodeDeactivated(_nodeId, msg.sender);
-        }
+        require(node.owner == msg.sender, "Not node owner");
+        require(_newPort > 0 && _newPort <= 65535, "Invalid port");
+        require(node.currentUsers == 0, "Cannot change port with active connections");  
+        node.port = _newPort;
+        emit NodePortUpdated(_nodeId, _newPort);
     }
 
-    // ----- Connection lifecycle -----
-
-    // Client pays estimated cost up-front; bandwidth is reserved at start
-    function startConnection(uint256 _nodeId, uint256 _expectedBandwidth) external nonReentrant {
+    function updateNodePrice(uint256 _nodeId, uint256 _newPricePerMinute) external {
         VPNNode storage node = nodes[_nodeId];
-        require(node.owner != address(0), "Node not found");
+        require(node.owner == msg.sender, "Not node owner");
+        require(_newPricePerMinute > 0, "Price must be positive");
+        node.pricePerMinute = _newPricePerMinute;
+        emit NodePriceUpdated(_nodeId, _newPricePerMinute);
+    }
+
+    function deactivateNode(uint256 _nodeId) external {
+        VPNNode storage node = nodes[_nodeId];
+        require(node.owner == msg.sender, "Not node owner");
+        require(node.isActive, "Node already inactive");
+        node.isActive = false;
+        emit NodeDeactivated(_nodeId);
+    }
+
+    function reactivateNode(uint256 _nodeId) external {
+        VPNNode storage node = nodes[_nodeId];
+        require(node.owner == msg.sender, "Not node owner");
+        require(!node.isActive, "Node already active");
+        require(bytes(node.ipAddress).length > 0, "Node IP not set");
+        node.isActive = true;
+        emit NodeReactivated(_nodeId);
+    }
+
+
+    // ========== SIMPLE PAYMENT SYSTEM ==========
+
+    function startConnection(uint256 _nodeId) external nonReentrant {
+        VPNNode storage node = nodes[_nodeId];
         require(node.isActive, "Node not active");
-        require(_expectedBandwidth > 0, "Expected bandwidth must be positive"); // remove bandwidth, consider in future
-        require(node.bandwidthAvailable >= _expectedBandwidth, "Insufficient bandwidth");
-        
-        uint256 expectedCost = _expectedBandwidth * node.pricePerGB;
-        require(expectedCost > 0, "Expected cost must be positive");
+        require(node.currentUsers < node.maxConcurrentUsers, "Node at capacity");
+        require(bytes(node.ipAddress).length > 0, "Node IP not set");
+        require(node.port > 0, "Node port not set");
 
-        // Transfer USDC from client to contract (uses SafeERC20)
-        usdcToken.safeTransferFrom(msg.sender, address(this), expectedCost);
+        // Pay for 1 minute upfront (minimum charge)
+        uint256 upfrontPayment = node.pricePerMinute;
+        require(upfrontPayment > 0, "Node price not set");
 
-        // Reserve bandwidth immediately (checks-effects-interactions)
-        node.bandwidthAvailable -= _expectedBandwidth;
+        // Take payment for 1 minute
+        usdcToken.safeTransferFrom(msg.sender, address(this), upfrontPayment);
+
+        // Reserve connection slot
+        node.currentUsers++;
 
         connectionCounter++;
         connections[connectionCounter] = VPNConnection({
@@ -129,111 +171,155 @@ contract DePinVPN is ReentrancyGuard, Ownable {
             nodeId: _nodeId,
             startTime: block.timestamp,
             endTime: 0,
-            expectedBandwidth: _expectedBandwidth,
-            actualBandwidthUsed: 0,
+            totalMinutesUsed: 0,
             isActive: true,
-            finalized: false,
-            amountPaid: expectedCost
+            amountPaid: upfrontPayment
         });
         
-        emit ConnectionStarted(connectionCounter, msg.sender, _nodeId, _expectedBandwidth, expectedCost);
+        emit ConnectionStarted(connectionCounter, msg.sender, _nodeId, _upfrontPayment);
     }
 
-    // Stop connection and report actual usage. Either client or node owner can call.
-    // This function finalizes the connection, calculates shares, refunds unused, and credits provider balance.
-    function stopConnection(uint256 _connectionId, uint256 _actualBandwidthUsed) external nonReentrant {
+    function stopConnection(uint256 _connectionId) external nonReentrant {
         VPNConnection storage conn = connections[_connectionId];
         require(conn.isActive, "Connection not active");
-        require(!conn.finalized, "Already finalized");
+        require(msg.sender == conn.client, "Only client can stop connection"); 
 
         VPNNode storage node = nodes[conn.nodeId];
         require(node.owner != address(0), "Node not found");
-        require(msg.sender == conn.client || msg.sender == node.owner, "Not authorized");
 
-        // actual used should not exceed reserved expected bandwidth by design
-        require(_actualBandwidthUsed <= conn.expectedBandwidth, "Actual bandwidth exceeds paid amount");
+        // Calculate minutes used (rounded up)
+        uint256 endTime = block.timestamp;
+        uint256 secondsUsed = endTime - conn.startTime;
+        uint256 minutesUsed = (secondsUsed + 59) / 60; // Round up to nearest minute
         
-        // Effects
+        // Update connection
         conn.isActive = false;
-        conn.endTime = block.timestamp;
-        conn.actualBandwidthUsed = _actualBandwidthUsed;
-        conn.finalized = true;
+        conn.endTime = endTime;
+        conn.totalMinutesUsed = _MinutesUsed;
 
-        // Calculate actual cost (in USDC)
-        uint256 actualCost = _actualBandwidthUsed * node.pricePerGB;
-        if (actualCost > conn.amountPaid) {
-            actualCost = conn.amountPaid; // Cap to amount paid
+        // Release connection slot
+        node.currentUsers--;
+
+        // Process payment based on actual minutes used
+        _processSimplePayment(_connectionId, conn, node, minutesUsed);
+    }
+
+ function _processSimplePayment(
+        uint256 _connectionId,
+        VPNConnection storage conn,
+        VPNNode storage node,
+        uint256 _minutesUsed
+    ) internal {
+        uint256 totalCost = _minutesUsed * node.pricePerMinute;
+        uint256 amountPaid = conn.amountPaid;
+
+        // If used more minutes than paid for, take additional payment
+        if (totalCost > amountPaid) {
+            uint256 additionalPayment = totalCost - amountPaid;
+            usdcToken.safeTransferFrom(conn.client, address(this), additionalPayment);
+            conn.amountPaid = totalCost;
         }
-
-        uint256 providerShare = (actualCost * (10000 - platformFeeBp)) / 10000;
-        uint256 platformShare = actualCost - providerShare;
+        
+        // Calculate distribution (always process full payment now)
+        uint256 finalAmount = conn.amountPaid;
+        uint256 providerShare = (finalAmount * (10000 - platformFeeBp)) / 10000;
+        uint256 platformShare = finalAmount - providerShare;
 
         // Update balances
         node.totalEarned += providerShare;
         providerBalances[node.owner] += providerShare;
         platformBalance += platformShare;
 
-        // If reserved bandwidth > actual used, release the remainder back to node availability
-        uint256 released = 0;
-        if (conn.expectedBandwidth >= _actualBandwidthUsed) {
-            released = conn.expectedBandwidth - _actualBandwidthUsed;
-            node.bandwidthAvailable += released;
-        }
-
-        // Refund unused paid amount to client (checks-effects-interactions done)
-        uint256 refund = 0;
-        if (conn.amountPaid > actualCost) {
-            refund = conn.amountPaid - actualCost;
-            if (refund > 0) {
-                usdcToken.safeTransfer(conn.client, refund);
-            }
+        // Emit event with usage details
+        uint256 refundAmount = 0;
+        if (finalAmount > totalCost) {
+            refundAmount = finalAmount - totalCost;
         }
         
-        emit ConnectionStopped(_connectionId, _actualBandwidthUsed, providerShare, platformShare);
+        emit ConnectionStopped(_connectionId, _minutesUsed, totalCost, refundAmount);
     }
 
-    // Owner (admin) can resolve disputes by setting actual usage and finalizing a connection.
-    function resolveConnection(uint256 _connectionId, uint256 _actualBandwidthUsed) external onlyOwner nonReentrant {
-        VPNConnection storage conn = connections[_connectionId];
-        require(conn.isActive, "Connection not active");
-        require(!conn.finalized, "Already finalized");
 
-        VPNNode storage node = nodes[conn.nodeId];
-        require(node.owner != address(0), "Node not found");
-        require(_actualBandwidthUsed <= conn.expectedBandwidth, "Actual > expected");
+ // ========== VIEW FUNCTIONS ==========
 
-        conn.isActive = false;
-        conn.endTime = block.timestamp;
-        conn.actualBandwidthUsed = _actualBandwidthUsed;
-        conn.finalized = true;
-
-        uint256 actualCost = _actualBandwidthUsed * node.pricePerGB;
-        if (actualCost > conn.amountPaid) actualCost = conn.amountPaid;
-
-        uint256 providerShare = (actualCost * (10000 - platformFeeBp)) / 10000;
-        uint256 platformShare = actualCost - providerShare;
-
-        node.totalEarned += providerShare;
-        providerBalances[node.owner] += providerShare;
-        platformBalance += platformShare;
-
-        if (conn.expectedBandwidth > _actualBandwidthUsed) {
-            uint256 released = conn.expectedBandwidth - _actualBandwidthUsed;
-            node.bandwidthAvailable += released;
-        }
-
-        if (conn.amountPaid > actualCost) {
-            uint256 refund = conn.amountPaid - actualCost;
-            if (refund > 0) {
-                usdcToken.safeTransfer(conn.client, refund);
+    function getAvailableNodes() external view returns (uint256[] memory) {
+        uint256 availableCount = 0;
+        
+        for (uint256 i = 1; i <= nodeCounter; i++) {
+            if (nodes[i].isActive && 
+                nodes[i].currentUsers < nodes[i].maxConcurrentUsers &&
+                bytes(nodes[i].ipAddress).length > 0 &&
+                nodes[i].port > 0) {
+                availableCount++;
             }
         }
 
-        emit ConnectionResolved(_connectionId, _actualBandwidthUsed, msg.sender);
-        emit ConnectionStopped(_connectionId, _actualBandwidthUsed, providerShare, platformShare);
+        uint256[] memory availableNodes = new uint256[](availableCount);
+        uint256 index = 0;
+        for (uint256 i = 1; i <= nodeCounter; i++) {
+            if (nodes[i].isActive && 
+                nodes[i].currentUsers < nodes[i].maxConcurrentUsers &&
+                bytes(nodes[i].ipAddress).length > 0 &&
+                nodes[i].port > 0) {
+                availableNodes[index] = i;
+                index++;
+            }
+        }
+        return availableNodes;
     }
 
-    // ----- Withdrawals -----
+    function getNodeDetails(uint256 _nodeId) external view returns (
+        address owner,
+        string memory ipAddress,
+        uint16 port,
+        uint256 pricePerMinute,
+        uint256 currentUsers,
+        uint256 maxConcurrentUsers,
+        bool isActive,
+        uint256 totalEarned,
+        uint256 reputation
+    ) {
+        VPNNode storage node = nodes[_nodeId];
+        return (
+            node.owner,
+            node.ipAddress,
+            node.port,
+            node.pricePerMinute,
+            node.currentUsers,
+            node.maxConcurrentUsers,
+            node.isActive,            
+            node.totalEarned,
+            node.reputation
+        );
+    }
+
+    function getConnectionCost(uint256 _nodeId, uint256 _minutes) external view returns (uint256) {
+        return nodes[_nodeId].pricePerMinute * _minutes;
+    }
+
+    function getConnectionUsage(uint256 _connectionId) external view returns (
+        uint256 startTime,
+        uint256 minutesUsed,
+        uint256 amountPaid,
+        bool isActive
+    ) {
+        VPNConnection storage conn = connections[_connectionId];
+        uint256 currentMinutes = 0;
+        if (conn.isActive) {
+            currentMinutes = (block.timestamp - conn.startTime + 59) / 60;
+        } else {
+            currentMinutes = conn.totalMinutesUsed;
+        }
+        
+        return (
+            conn.startTime,
+            currentMinutes,
+            conn.amountPaid,
+            conn.isActive
+        );
+    }
+
+    // ========== WITHDRAWAL FUNCTIONS ==========
 
     function withdrawEarnings() external nonReentrant {
         uint256 amount = providerBalances[msg.sender];
@@ -243,32 +329,33 @@ contract DePinVPN is ReentrancyGuard, Ownable {
         emit Withdrawn(msg.sender, amount);
     }
 
+    function withdrawClientBalance() external nonReentrant {
+        uint256 amount = clientBalances[msg.sender];
+        require(amount > 0, "No balance to withdraw");
+        clientBalances[msg.sender] = 0;
+        usdcToken.safeTransfer(msg.sender, amount);
+        emit Withdrawn(msg.sender, amount);
+    }
+
     function withdrawPlatformFees(address _to) external onlyOwner nonReentrant {
-        require(_to != address(0), "Invalid address");
         uint256 amount = platformBalance;
         require(amount > 0, "No platform balance");
         platformBalance = 0;
         usdcToken.safeTransfer(_to, amount);
-        emit PlatformWithdrawn(_to, amount);
+        emit PlatformFeesWithdrawn(_to, amount);
     }
 
-    // ----- Admin Functions -----
+    // ========== ADMIN FUNCTIONS ==========
     
     function setPlatformFee(uint256 _feeBp) external onlyOwner {
-        require(_feeBp <= MAX_PLATFORM_FEE_BP, "Fee too high");
+        require(_feeBp <= MAX_PLATFORM_FEE_BP, "Fee too high"); // Max 10%
         platformFeeBp = _feeBp;
         emit PlatformFeeUpdated(_feeBp);
     }
 
-    // ----- Views / Helpers -----
-
-    function getNode(uint256 _nodeId) external view returns (VPNNode memory) {
-        return nodes[_nodeId];
+    function adminDeactivateNode(uint256 _nodeId) external onlyOwner {
+        VPNNode storage node = nodes[_nodeId];
+        require(node.isActive, "Node already inactive");        
+        node.isActive = false;
+        emit NodeDeactivated(_nodeId);
     }
-
-    function getConnection(uint256 _connectionId) external view returns (VPNConnection memory) {
-        return connections[_connectionId];
-    }
-
-}
-
