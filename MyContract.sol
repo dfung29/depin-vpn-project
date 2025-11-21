@@ -3,7 +3,7 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract DePinVPN is ReentrancyGuard, Ownable {
@@ -15,7 +15,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
 
     struct VPNNode {
         address owner; 
-        string ipAddress;       // IP stored on-chain. For future reference, consider encryption for privacy)
+        string ipAddress;       // IP stored on-chain. For future reference, consider encryption for privacy
         uint16 port;           
         uint256 pricePerMinute; // price expressed in USDC (smallest unit) per minute
         uint256 totalEarned;
@@ -30,7 +30,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
         uint256 nodeId;
         uint256 startTime;
         uint256 endTime;
-        uint256 totalMinutesUsed; // Simple minute tracking
+        uint256 minutesUsed; // Simple minute tracking
         bool isActive;
         uint256 amountPaid;
     }
@@ -68,7 +68,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
     event PlatformFeesWithdrawn(address indexed to, uint256 amount);
 
 
-    constructor(address _usdc) {
+    constructor(address _usdc) Ownable(msg.sender) {
         require(_usdc != address(0), "Invalid USDC address");
         usdcToken = IERC20(_usdc);
     }
@@ -95,7 +95,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
             pricePerMinute: _pricePerMinute,
             totalEarned: 0,
             reputation: 100,
-            isActive: true
+            isActive: true,
             maxConcurrentUsers: _maxConcurrentUsers,
             currentUsers: 0
         });
@@ -171,12 +171,12 @@ contract DePinVPN is ReentrancyGuard, Ownable {
             nodeId: _nodeId,
             startTime: block.timestamp,
             endTime: 0,
-            totalMinutesUsed: 0,
+            minutesUsed: 0,
             isActive: true,
             amountPaid: upfrontPayment
         });
         
-        emit ConnectionStarted(connectionCounter, msg.sender, _nodeId, _upfrontPayment);
+        emit ConnectionStarted(connectionCounter, msg.sender, _nodeId, upfrontPayment);
     }
 
     function stopConnection(uint256 _connectionId) external nonReentrant {
@@ -195,7 +195,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
         // Update connection
         conn.isActive = false;
         conn.endTime = endTime;
-        conn.totalMinutesUsed = _MinutesUsed;
+        conn.minutesUsed = minutesUsed;
 
         // Release connection slot
         node.currentUsers--;
@@ -217,25 +217,29 @@ contract DePinVPN is ReentrancyGuard, Ownable {
         if (totalCost > amountPaid) {
             uint256 additionalPayment = totalCost - amountPaid;
             usdcToken.safeTransferFrom(conn.client, address(this), additionalPayment);
-            conn.amountPaid = totalCost;
+            amountPaid = totalCost;
         }
-        
-        // Calculate distribution (always process full payment now)
-        uint256 finalAmount = conn.amountPaid;
-        uint256 providerShare = (finalAmount * (10000 - platformFeeBp)) / 10000;
-        uint256 platformShare = finalAmount - providerShare;
+
+        uint256 refundAmount = 0;
+        // If user overpaid, record refund to client balances
+        if (amountPaid > totalCost) {
+            refundAmount = amountPaid - totalCost;
+            clientBalances[conn.client] += refundAmount;
+            amountPaid = totalCost;
+        }
+
+        // Calculate distribution based on the actual cost
+        uint256 providerShare = (totalCost * (10000 - platformFeeBp)) / 10000;
+        uint256 platformShare = totalCost - providerShare;
 
         // Update balances
         node.totalEarned += providerShare;
         providerBalances[node.owner] += providerShare;
         platformBalance += platformShare;
 
-        // Emit event with usage details
-        uint256 refundAmount = 0;
-        if (finalAmount > totalCost) {
-            refundAmount = finalAmount - totalCost;
-        }
-        
+        // Clear the paid amount on the connection (funds are allocated)
+        conn.amountPaid = 0;
+
         emit ConnectionStopped(_connectionId, _minutesUsed, totalCost, refundAmount);
     }
 
@@ -308,7 +312,7 @@ contract DePinVPN is ReentrancyGuard, Ownable {
         if (conn.isActive) {
             currentMinutes = (block.timestamp - conn.startTime + 59) / 60;
         } else {
-            currentMinutes = conn.totalMinutesUsed;
+            currentMinutes = conn.minutesUsed;
         }
         
         return (
